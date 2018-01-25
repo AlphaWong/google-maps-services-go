@@ -16,6 +16,7 @@ package maps
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -25,8 +26,8 @@ import (
 	"net/url"
 	"time"
 
-	"golang.org/x/net/context"
 	"golang.org/x/net/context/ctxhttp"
+	"golang.org/x/time/rate"
 	"googlemaps.github.io/maps/internal"
 )
 
@@ -38,7 +39,8 @@ type Client struct {
 	clientID          string
 	signature         []byte
 	requestsPerSecond int
-	rateLimiter       chan int
+	rateLimiter       *rate.Limiter
+	context           context.Context
 	channel           string
 }
 
@@ -62,21 +64,8 @@ func NewClient(options ...ClientOption) (*Client, error) {
 	}
 
 	if c.requestsPerSecond > 0 {
-		// Implement a bursty rate limiter.
-		// Allow up to 1 second worth of requests to be made at once.
-		c.rateLimiter = make(chan int, c.requestsPerSecond)
-		// Prefill rateLimiter with 1 seconds worth of requests.
-		for i := 0; i < c.requestsPerSecond; i++ {
-			c.rateLimiter <- 1
-		}
-		go func() {
-			// Wait a second for pre-filled quota to drain
-			time.Sleep(time.Second)
-			// Then, refill rateLimiter continuously
-			for range time.Tick(time.Second / time.Duration(c.requestsPerSecond)) {
-				c.rateLimiter <- 1
-			}
-		}()
+		c.rateLimiter = rate.NewLimiter(rate.Limit(c.requestsPerSecond), c.requestsPerSecond)
+		c.context, _ = context.WithCancel(context.TODO())
 	}
 
 	return c, nil
@@ -136,15 +125,6 @@ func WithClientIDAndSignature(clientID, signature string) ClientOption {
 	}
 }
 
-// WithRateLimit configures the rate limit for back end requests. Default is to
-// limit to 50 requests per second. A value of zero disables rate limiting.
-func WithRateLimit(requestsPerSecond int) ClientOption {
-	return func(c *Client) error {
-		c.requestsPerSecond = requestsPerSecond
-		return nil
-	}
-}
-
 type apiConfig struct {
 	host            string
 	path            string
@@ -155,23 +135,18 @@ type apiRequest interface {
 	params() url.Values
 }
 
-func (c *Client) awaitRateLimiter(ctx context.Context) error {
-	if c.rateLimiter == nil {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.rateLimiter:
-		// Execute request.
+// WithRateLimit configures the rate limit for back end requests. Default is to
+// limit to 50 requests per second. A value of zero disables rate limiting.
+func WithRateLimit(requestsPerSecond int) ClientOption {
+	return func(c *Client) error {
+		c.requestsPerSecond = requestsPerSecond
 		return nil
 	}
 }
 
 func (c *Client) get(ctx context.Context, config *apiConfig, apiReq apiRequest) (*http.Response, error) {
-	if err := c.awaitRateLimiter(ctx); err != nil {
-		return nil, err
-	}
+	c.rateLimiter.Wait(c.context)
+	time.Sleep(time.Second)
 
 	host := config.host
 	if c.baseURL != "" {
@@ -190,9 +165,8 @@ func (c *Client) get(ctx context.Context, config *apiConfig, apiReq apiRequest) 
 }
 
 func (c *Client) post(ctx context.Context, config *apiConfig, apiReq interface{}) (*http.Response, error) {
-	if err := c.awaitRateLimiter(ctx); err != nil {
-		return nil, err
-	}
+	c.rateLimiter.Wait(c.context)
+	time.Sleep(time.Second)
 
 	host := config.host
 	if c.baseURL != "" {
